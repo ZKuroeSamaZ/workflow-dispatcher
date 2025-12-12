@@ -131,7 +131,7 @@ async function confirm(msg) {
 // -------------------------------------------------------------
 // Main Logic
 // -------------------------------------------------------------
-export default async function runCLI() {
+export default async function main() {
   if (!has("git")) {
     console.error("git not found");
     process.exit(1);
