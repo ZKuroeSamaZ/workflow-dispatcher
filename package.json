@@ -1,0 +1,24 @@
+{
+  "name": "@ZKuroeSamaZ/workflow-dispatcher",
+  "version": "1.0.0",
+  "type": "module",
+  "bin": {
+    "workflow-dispatcher": "./bin/workflow-dispatcher.js"
+  },
+  "main": "src/index.js",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/ZKuroeSamaZ/workflow-dispatcher.git"
+  },
+  "keywords": [
+    "github",
+    "workflow",
+    "dispatcher",
+    "cli"
+  ],
+  "author": "ZKuroeSamaZ",
+  "license": "MIT",
+  "dependencies": {
+    "enquirer": "^2.4.1"
+  }
+}
