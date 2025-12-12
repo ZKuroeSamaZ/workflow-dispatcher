@@ -42,31 +42,17 @@ async function readlineConfirm(message) {
 }
 
 // -------------------------------------------------------------
-// FZF async selector (non-freezing)
+// FZF async selector returning values
 // -------------------------------------------------------------
 async function selectWithFzf(items, prompt, multi = false) {
   if (!has("fzf")) return null;
   if (!items.length) return [];
 
-  const input = items.map((item, idx) => `${idx + 1}\t${item}`).join("\n");
+  const input = items.join("\n");
 
   return new Promise((resolve) => {
-    const header = multi
-      ? "Hint: use Space to select, Ctrl-A to toggle visible items."
-      : "";
-
-    const args = [
-      "--prompt",
-      `${prompt}: `,
-      "--layout=reverse",
-      "--ansi",
-      "--header",
-      header,
-    ];
-    if (multi) {
-      args.push("--multi");
-      args.push("--bind", "ctrl-a:toggle-all");
-    }
+    const args = ["--prompt", `${prompt}: `, "--layout=reverse"];
+    if (multi) args.push("--multi");
 
     const proc = spawn("fzf", args, {
       stdio: ["pipe", "pipe", "inherit"],
@@ -79,16 +65,12 @@ async function selectWithFzf(items, prompt, multi = false) {
 
     proc.on("close", () => {
       if (!out.trim()) return resolve([]);
-      const idxs = out
+      const values = out
         .trim()
         .split("\n")
-        .map((line) => {
-          const tok = line.split("\t", 1)[0].trim();
-          const n = parseInt(tok, 10);
-          return Number.isNaN(n) ? -1 : n - 1;
-        })
-        .filter((i) => i >= 0 && i < items.length);
-      resolve(idxs);
+        .map((line) => line.trim())
+        .filter(Boolean);
+      resolve(values);
     });
 
     proc.stdin.write(input);
@@ -97,7 +79,7 @@ async function selectWithFzf(items, prompt, multi = false) {
 }
 
 // -------------------------------------------------------------
-// Enquirer selectors (CommonJS class compatible)
+// Enquirer selectors
 // -------------------------------------------------------------
 export async function selectWithEnquirerSingle(items, message) {
   const prompt = new AutoComplete({
@@ -107,7 +89,7 @@ export async function selectWithEnquirerSingle(items, message) {
     limit: 10,
   });
   const answer = await prompt.run();
-  return items.indexOf(answer);
+  return answer; // return value directly
 }
 
 export async function selectWithEnquirerMulti(items, message) {
@@ -136,9 +118,7 @@ export async function selectWithEnquirerMulti(items, message) {
     }
 
     if (filter === ":done") {
-      return Array.from(selectedSet)
-        .map((v) => items.indexOf(v))
-        .filter((i) => i >= 0);
+      return Array.from(selectedSet); // return values directly
     }
     if (filter === ":reset") {
       selectedSet.clear();
@@ -147,11 +127,7 @@ export async function selectWithEnquirerMulti(items, message) {
 
     const q = filter.toLowerCase();
     const visible =
-      q === ""
-        ? items.map((it, idx) => ({ it, idx }))
-        : items
-            .map((it, idx) => ({ it, idx }))
-            .filter(({ it }) => it.toLowerCase().includes(q));
+      q === "" ? items : items.filter((it) => it.toLowerCase().includes(q));
 
     if (!visible.length) {
       console.log("No items match that filter — try again.");
@@ -165,7 +141,7 @@ export async function selectWithEnquirerMulti(items, message) {
         value: "__TOGGLE__",
       },
       new Separator(),
-      ...visible.map(({ it }) => ({
+      ...visible.map((it) => ({
         name: it,
         message: it,
         value: it,
@@ -190,15 +166,15 @@ export async function selectWithEnquirerMulti(items, message) {
     if (result.includes("__TOGGLE__")) {
       const rest = result.filter((v) => v !== "__TOGGLE__");
       if (!rest.length) {
-        const allSelected = visible.every(({ it }) => selectedSet.has(it));
-        if (allSelected) visible.forEach(({ it }) => selectedSet.delete(it));
-        else visible.forEach(({ it }) => selectedSet.add(it));
+        const allSelected = visible.every((it) => selectedSet.has(it));
+        if (allSelected) visible.forEach((it) => selectedSet.delete(it));
+        else visible.forEach((it) => selectedSet.add(it));
       } else {
-        visible.forEach(({ it }) => selectedSet.delete(it));
+        visible.forEach((it) => selectedSet.delete(it));
         rest.forEach((v) => selectedSet.add(v));
       }
     } else {
-      visible.forEach(({ it }) => selectedSet.delete(it));
+      visible.forEach((it) => selectedSet.delete(it));
       result.forEach((v) => selectedSet.add(v));
     }
   }
@@ -241,12 +217,11 @@ export async function main() {
     return;
   }
 
-  let refIdxs = await selectWithFzf(refs, "Select branch/tag", false);
-  let refIdx =
-    refIdxs === null
+  let selectedRef = await selectWithFzf(refs, "Select branch/tag", false);
+  selectedRef =
+    selectedRef === null
       ? await selectWithEnquirerSingle(refs, "Select branch or tag")
-      : refIdxs[0];
-  const selectedRef = refs[refIdx];
+      : selectedRef[0];
   console.log("Selected ref:", selectedRef);
 
   const raw = run("gh", [
@@ -273,18 +248,17 @@ export async function main() {
     return;
   }
 
-  let wIdxs = await selectWithFzf(workflows, "Select workflows", true);
-  if (wIdxs === null)
-    wIdxs = await selectWithEnquirerMulti(
+  let chosen = await selectWithFzf(workflows, "Select workflows", true);
+  if (chosen === null)
+    chosen = await selectWithEnquirerMulti(
       workflows,
       "Select workflows to dispatch",
     );
-  if (!wIdxs.length) {
+  if (!chosen.length) {
     console.log("Nothing selected.");
     return;
   }
 
-  const chosen = wIdxs.map((i) => workflows[i]);
   console.log("\nWill dispatch:");
   for (const w of chosen) console.log(" -", w);
 
