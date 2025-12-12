@@ -2,6 +2,7 @@
 import { execFileSync, spawn } from "node:child_process";
 import readline from "node:readline";
 import Enquirer from "enquirer";
+
 const { AutoComplete, MultiSelect, Separator, Confirm, Input } = Enquirer;
 
 // -------------------------------------------------------------
@@ -25,7 +26,7 @@ function run(cmd, args) {
 }
 
 // -------------------------------------------------------------
-// Pure-Node confirm (readline) fallback
+// Pure-Node confirm fallback
 // -------------------------------------------------------------
 async function readlineConfirm(message) {
   const rl = readline.createInterface({
@@ -41,7 +42,7 @@ async function readlineConfirm(message) {
 }
 
 // -------------------------------------------------------------
-// FZF async selector (non-freezing) with Ctrl-A toggle for visible items
+// FZF async selector (non-freezing)
 // -------------------------------------------------------------
 async function selectWithFzf(items, prompt, multi = false) {
   if (!has("fzf")) return null;
@@ -51,7 +52,7 @@ async function selectWithFzf(items, prompt, multi = false) {
 
   return new Promise((resolve) => {
     const header = multi
-      ? "Hint: use Space to select, Ctrl-A to toggle all VISIBLE items (after filtering)."
+      ? "Hint: use Space to select, Ctrl-A to toggle visible items."
       : "";
 
     const args = [
@@ -96,15 +97,16 @@ async function selectWithFzf(items, prompt, multi = false) {
 }
 
 // -------------------------------------------------------------
-// Enquirer selectors (v3+ compatible)
+// Enquirer selectors (CommonJS class compatible)
 // -------------------------------------------------------------
 export async function selectWithEnquirerSingle(items, message) {
-  const answer = await AutoComplete({
+  const prompt = new AutoComplete({
     name: "choice",
     message,
     choices: items,
     limit: 10,
-  })();
+  });
+  const answer = await prompt.run();
   return items.indexOf(answer);
 }
 
@@ -114,17 +116,24 @@ export async function selectWithEnquirerMulti(items, message) {
   function summary() {
     if (selectedSet.size === 0) return "(none)";
     const sample = Array.from(selectedSet).slice(0, 6);
-    return `${selectedSet.size} selected — ${sample.join(", ")}${selectedSet.size > 6 ? ", ..." : ""}`;
+    return `${selectedSet.size} selected — ${sample.join(", ")}${
+      selectedSet.size > 6 ? ", ..." : ""
+    }`;
   }
 
   while (true) {
-    const filter = (
-      await Input({
-        name: "filter",
-        message: `${message} — filter (empty = all). Commands: :done (finish), :reset (clear). Current: ${summary()}`,
-        initial: "",
-      })()
-    ).trim();
+    const filterPrompt = new Input({
+      name: "filter",
+      message: `${message} — filter (empty = all). Commands: :done (finish), :reset (clear). Current: ${summary()}`,
+      initial: "",
+    });
+
+    let filter = "";
+    try {
+      filter = (await filterPrompt.run()).trim();
+    } catch {
+      return [];
+    }
 
     if (filter === ":done") {
       return Array.from(selectedSet)
@@ -164,13 +173,19 @@ export async function selectWithEnquirerMulti(items, message) {
       })),
     ];
 
-    let result = await MultiSelect({
-      name: "pick",
-      message: `Filtered: ${visible.length} shown — use space to (un)select, enter to submit`,
-      hint: "(space to toggle, type to re-filter after submit)",
-      choices,
-      limit: 15,
-    })();
+    let result = [];
+    try {
+      const ms = new MultiSelect({
+        name: "pick",
+        message: `Filtered: ${visible.length} shown — use space to (un)select, enter to submit`,
+        hint: "(space to toggle, type to re-filter after submit)",
+        choices,
+        limit: 15,
+      });
+      result = await ms.run();
+    } catch {
+      return [];
+    }
 
     if (result.includes("__TOGGLE__")) {
       const rest = result.filter((v) => v !== "__TOGGLE__");
@@ -191,7 +206,8 @@ export async function selectWithEnquirerMulti(items, message) {
 
 export async function confirm(message) {
   try {
-    return await EnquirerConfirm({ name: "ok", message })();
+    const c = new Confirm({ name: "ok", message });
+    return await c.run();
   } catch {
     return await readlineConfirm(message);
   }
