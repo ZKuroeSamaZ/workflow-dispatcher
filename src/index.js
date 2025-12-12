@@ -1,5 +1,6 @@
 // src/index.js
 import { execFileSync, spawn } from "node:child_process";
+import readline from "node:readline";
 
 // -------------------------------------------------------------
 // Utilities
@@ -22,20 +23,57 @@ function run(cmd, args) {
 }
 
 // -------------------------------------------------------------
-// FZF async selector (non-freezing)
+// Pure-Node confirm (readline) - bulletproof across envs
+// -------------------------------------------------------------
+async function confirm(message) {
+  const rl = readline.createInterface({
+    input: process.stdin,
+    output: process.stdout,
+  });
+
+  const answer = await new Promise((resolve) => {
+    rl.question(`${message} (y/N) `, (ans) => resolve(ans));
+  });
+
+  rl.close();
+
+  const a = (answer || "").trim().toLowerCase();
+  return a === "y" || a === "yes";
+}
+
+// -------------------------------------------------------------
+// FZF async selector (non-freezing) with Ctrl-A toggle for visible items
 // -------------------------------------------------------------
 async function selectWithFzf(items, prompt, multi = false) {
   if (!has("fzf")) return null;
   if (!items.length) return [];
 
+  // build numbered lines so we can map back to original indices
   const input = items.map((item, idx) => `${idx + 1}\t${item}`).join("\n");
 
   return new Promise((resolve) => {
-    const args = ["--prompt", `${prompt}: `, "--layout=reverse"];
-    if (multi) args.push("--multi");
+    // header explains Ctrl-A behaviour when multi
+    const header = multi
+      ? "Hint: use Space to select, Ctrl-A to toggle all VISIBLE items (after filtering)."
+      : "";
+
+    const args = [
+      "--prompt",
+      `${prompt}: `,
+      "--layout=reverse",
+      "--ansi",
+      "--header",
+      header,
+    ];
+    if (multi) {
+      args.push("--multi");
+      // ensure ctrl-a toggles visible entries
+      args.push("--bind", "ctrl-a:toggle-all");
+    }
 
     const proc = spawn("fzf", args, {
       stdio: ["pipe", "pipe", "inherit"],
+      env: process.env,
     });
 
     let out = "";
@@ -44,10 +82,15 @@ async function selectWithFzf(items, prompt, multi = false) {
 
     proc.on("close", () => {
       if (!out.trim()) return resolve([]);
+      // parse lines like "  12\tworkflow name"
       const idxs = out
         .trim()
         .split("\n")
-        .map((line) => parseInt(line.split("\t")[0], 10) - 1)
+        .map((line) => {
+          const tok = line.split("\t", 1)[0].trim();
+          const n = parseInt(tok, 10);
+          return Number.isNaN(n) ? -1 : n - 1;
+        })
         .filter((i) => i >= 0 && i < items.length);
       resolve(idxs);
     });
@@ -58,7 +101,7 @@ async function selectWithFzf(items, prompt, multi = false) {
 }
 
 // -------------------------------------------------------------
-// Enquirer Selectors
+// Enquirer selectors
 // -------------------------------------------------------------
 async function selectWithEnquirerSingle(items, message) {
   const { AutoComplete } = await import("enquirer");
@@ -66,15 +109,21 @@ async function selectWithEnquirerSingle(items, message) {
     name: "choice",
     message,
     choices: items,
+    limit: 10,
   });
   const ans = await prompt.run();
   return items.indexOf(ans);
 }
 
-// Replace your existing selectWithEnquirerMulti with this function.
-// It uses a loop: ask for a filter, present MultiSelect of filtered items
-// (with a Toggle visible option), update global selection state, repeat
-// until user confirms they're done.
+/**
+ * Enquirer multi-select with visible-toggle:
+ * - Loop: ask a filter, show visible items + a Toggle visible option
+ * - Toggle affects only the visible (filtered) items
+ * - Selections persist across filter changes
+ * - Commands at filter step:
+ *    :done  -> finish and return indices
+ *    :reset -> clear all selections
+ */
 async function selectWithEnquirerMulti(items, message) {
   const { Input, MultiSelect, Separator } = await import("enquirer");
 
@@ -88,10 +137,8 @@ async function selectWithEnquirerMulti(items, message) {
     return `${selectedSet.size} selected — ${sample.join(", ")}${selectedSet.size > 6 ? ", ..." : ""}`;
   }
 
+  // Main loop: filter -> pick -> update selectedSet -> repeat until :done
   while (true) {
-    // 1) Ask user for a filter string (empty => all). Special commands:
-    //    :done -> finish selection
-    //    :reset -> clear all selections
     const inPrompt = new Input({
       name: "filter",
       message: `${message} — filter (empty = all). Commands: :done (finish), :reset (clear). Current: ${summary()}`,
@@ -102,7 +149,7 @@ async function selectWithEnquirerMulti(items, message) {
     try {
       filter = (await inPrompt.run()).trim();
     } catch {
-      // user aborted input (Ctrl+C)
+      // user aborted (Ctrl+C)
       return [];
     }
 
@@ -115,11 +162,10 @@ async function selectWithEnquirerMulti(items, message) {
 
     if (filter === ":reset") {
       selectedSet.clear();
-      // go back to filter prompt loop
       continue;
     }
 
-    // compute visible (filtered) items
+    // compute visible (filtered) items (preserve original ordering & index)
     const q = filter.toLowerCase();
     const visible =
       q === ""
@@ -133,7 +179,7 @@ async function selectWithEnquirerMulti(items, message) {
       continue;
     }
 
-    // Build MultiSelect choices: first the toggle option, then visible items
+    // Build MultiSelect choices: toggle option, separator, visible items (marked as selected if in selectedSet)
     const choices = [
       {
         name: "__TOGGLE__",
@@ -145,7 +191,6 @@ async function selectWithEnquirerMulti(items, message) {
         name: it,
         message: it,
         value: it,
-        // mark as selected if present in the global selectedSet
         selected: selectedSet.has(it),
       })),
     ];
@@ -155,6 +200,8 @@ async function selectWithEnquirerMulti(items, message) {
       message: `Filtered: ${visible.length} shown — use space to (un)select, enter to submit`,
       hint: "(space to toggle, type to re-filter after submit)",
       choices,
+      // keep limit reasonable
+      limit: 15,
     });
 
     let result;
@@ -165,13 +212,11 @@ async function selectWithEnquirerMulti(items, message) {
       return [];
     }
 
-    // result contains the selected values from the visible subset (and possibly __TOGGLE__)
-    // Handle toggle semantics:
+    // result may contain '__TOGGLE__' and/or a selection of visible items
     if (result.includes("__TOGGLE__")) {
-      // If user selected only the toggle -> we interpret as "invert selection of visible"
       const rest = result.filter((v) => v !== "__TOGGLE__");
       if (rest.length === 0) {
-        // decide: if ALL visible currently selected -> unselect them; else select them
+        // user selected only the toggle -> invert selection on visible items
         const allSelected = visible.every(({ it }) => selectedSet.has(it));
         if (allSelected) {
           // unselect all visible
@@ -181,36 +226,24 @@ async function selectWithEnquirerMulti(items, message) {
           for (const { it } of visible) selectedSet.add(it);
         }
       } else {
-        // toggle + some explicit selections -> treat explicit selections as chosen (remove toggle)
-        // update selectedSet: ensure visible items are set exactly to rest
-        // first remove all visible items from selectedSet
+        // user chose toggle + explicit items -> set visible items exactly to explicit selection
         for (const { it } of visible) selectedSet.delete(it);
-        // then add rest
         for (const v of rest) selectedSet.add(v);
       }
     } else {
-      // No toggle in result: update visible items to match selection
-      // remove all visible from selectedSet, then add those returned
+      // Normal path: set visible items to match selection
       for (const { it } of visible) selectedSet.delete(it);
       for (const v of result) selectedSet.add(v);
     }
 
-    // loop again: user can re-filter, check summary, etc.
-    // Optionally we could ask "done?" here, but the filter prompt supports :done
-    // and the loop shows the current summary so user knows status.
+    // Loop back to allow re-filtering and fine-grain edits
   }
-}
-
-async function confirm(msg) {
-  const { Confirm } = await import("enquirer");
-  const c = new Confirm({ name: "ok", message: msg });
-  return await c.run();
 }
 
 // -------------------------------------------------------------
 // Main Logic
 // -------------------------------------------------------------
-export default async function main() {
+export async function main() {
   if (!has("git")) {
     console.error("git not found");
     process.exit(1);
@@ -236,12 +269,18 @@ export default async function main() {
     return;
   }
 
-  // 2. Select ref
+  // 2. Select ref (fzf single or enquirer fallback)
   let refIdxs = await selectWithFzf(refs, "Select branch/tag", false);
-  let refIdx =
-    refIdxs === null
-      ? await selectWithEnquirerSingle(refs, "Select branch or tag")
-      : refIdxs[0];
+  let refIdx;
+  if (refIdxs === null) {
+    refIdx = await selectWithEnquirerSingle(refs, "Select branch or tag");
+  } else {
+    if (!refIdxs.length) {
+      console.log("No selection.");
+      return;
+    }
+    refIdx = refIdxs[0];
+  }
 
   const selectedRef = refs[refIdx];
   console.log("Selected ref:", selectedRef);
@@ -259,13 +298,13 @@ export default async function main() {
   let data;
   try {
     data = JSON.parse(raw);
-  } catch {
-    console.error("Invalid workflow JSON.");
+  } catch (e) {
+    console.error("Invalid workflow JSON:", e && e.message ? e.message : e);
     return;
   }
 
   const workflows = data
-    .filter((w) => w.state === "active")
+    .filter((w) => w && w.state === "active")
     .map((w) => `${w.name} — ${w.path}`);
 
   if (!workflows.length) {
@@ -275,7 +314,6 @@ export default async function main() {
 
   // 4. Select workflows (multi)
   let wIdxs = await selectWithFzf(workflows, "Select workflows", true);
-
   if (wIdxs === null) {
     wIdxs = await selectWithEnquirerMulti(
       workflows,
