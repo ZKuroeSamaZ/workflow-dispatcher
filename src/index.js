@@ -1,6 +1,13 @@
 // src/index.js
 import { execFileSync, spawn } from "node:child_process";
 import readline from "node:readline";
+import {
+  AutoComplete,
+  MultiSelect,
+  Separator,
+  Confirm as EnquirerConfirm,
+  Input,
+} from "enquirer";
 
 // -------------------------------------------------------------
 // Utilities
@@ -23,20 +30,17 @@ function run(cmd, args) {
 }
 
 // -------------------------------------------------------------
-// Pure-Node confirm (readline) - bulletproof across envs
+// Pure-Node confirm (readline) fallback
 // -------------------------------------------------------------
-async function confirm(message) {
+async function readlineConfirm(message) {
   const rl = readline.createInterface({
     input: process.stdin,
     output: process.stdout,
   });
-
   const answer = await new Promise((resolve) => {
     rl.question(`${message} (y/N) `, (ans) => resolve(ans));
   });
-
   rl.close();
-
   const a = (answer || "").trim().toLowerCase();
   return a === "y" || a === "yes";
 }
@@ -48,11 +52,9 @@ async function selectWithFzf(items, prompt, multi = false) {
   if (!has("fzf")) return null;
   if (!items.length) return [];
 
-  // build numbered lines so we can map back to original indices
   const input = items.map((item, idx) => `${idx + 1}\t${item}`).join("\n");
 
   return new Promise((resolve) => {
-    // header explains Ctrl-A behaviour when multi
     const header = multi
       ? "Hint: use Space to select, Ctrl-A to toggle all VISIBLE items (after filtering)."
       : "";
@@ -67,7 +69,6 @@ async function selectWithFzf(items, prompt, multi = false) {
     ];
     if (multi) {
       args.push("--multi");
-      // ensure ctrl-a toggles visible entries
       args.push("--bind", "ctrl-a:toggle-all");
     }
 
@@ -82,7 +83,6 @@ async function selectWithFzf(items, prompt, multi = false) {
 
     proc.on("close", () => {
       if (!out.trim()) return resolve([]);
-      // parse lines like "  12\tworkflow name"
       const idxs = out
         .trim()
         .split("\n")
@@ -101,71 +101,46 @@ async function selectWithFzf(items, prompt, multi = false) {
 }
 
 // -------------------------------------------------------------
-// Enquirer selectors
+// Enquirer selectors (v3+ compatible)
 // -------------------------------------------------------------
-async function selectWithEnquirerSingle(items, message) {
-  const { AutoComplete } = await import("enquirer");
-  const prompt = new AutoComplete({
+export async function selectWithEnquirerSingle(items, message) {
+  const answer = await AutoComplete({
     name: "choice",
     message,
     choices: items,
     limit: 10,
-  });
-  const ans = await prompt.run();
-  return items.indexOf(ans);
+  })();
+  return items.indexOf(answer);
 }
 
-/**
- * Enquirer multi-select with visible-toggle:
- * - Loop: ask a filter, show visible items + a Toggle visible option
- * - Toggle affects only the visible (filtered) items
- * - Selections persist across filter changes
- * - Commands at filter step:
- *    :done  -> finish and return indices
- *    :reset -> clear all selections
- */
-async function selectWithEnquirerMulti(items, message) {
-  const { Input, MultiSelect, Separator } = await import("enquirer");
-
-  // track selected values (strings from items)
+export async function selectWithEnquirerMulti(items, message) {
   const selectedSet = new Set();
 
-  // helper: show a short summary of current selections
   function summary() {
     if (selectedSet.size === 0) return "(none)";
     const sample = Array.from(selectedSet).slice(0, 6);
     return `${selectedSet.size} selected — ${sample.join(", ")}${selectedSet.size > 6 ? ", ..." : ""}`;
   }
 
-  // Main loop: filter -> pick -> update selectedSet -> repeat until :done
   while (true) {
-    const inPrompt = new Input({
-      name: "filter",
-      message: `${message} — filter (empty = all). Commands: :done (finish), :reset (clear). Current: ${summary()}`,
-      initial: "",
-    });
-
-    let filter;
-    try {
-      filter = (await inPrompt.run()).trim();
-    } catch {
-      // user aborted (Ctrl+C)
-      return [];
-    }
+    const filter = (
+      await Input({
+        name: "filter",
+        message: `${message} — filter (empty = all). Commands: :done (finish), :reset (clear). Current: ${summary()}`,
+        initial: "",
+      })()
+    ).trim();
 
     if (filter === ":done") {
-      // finish and return selected indices
       return Array.from(selectedSet)
         .map((v) => items.indexOf(v))
         .filter((i) => i >= 0);
     }
-
     if (filter === ":reset") {
       selectedSet.clear();
       continue;
     }
 
-    // compute visible (filtered) items (preserve original ordering & index)
     const q = filter.toLowerCase();
     const visible =
       q === ""
@@ -174,12 +149,11 @@ async function selectWithEnquirerMulti(items, message) {
             .map((it, idx) => ({ it, idx }))
             .filter(({ it }) => it.toLowerCase().includes(q));
 
-    if (visible.length === 0) {
+    if (!visible.length) {
       console.log("No items match that filter — try again.");
       continue;
     }
 
-    // Build MultiSelect choices: toggle option, separator, visible items (marked as selected if in selectedSet)
     const choices = [
       {
         name: "__TOGGLE__",
@@ -195,55 +169,43 @@ async function selectWithEnquirerMulti(items, message) {
       })),
     ];
 
-    const ms = new MultiSelect({
+    let result = await MultiSelect({
       name: "pick",
       message: `Filtered: ${visible.length} shown — use space to (un)select, enter to submit`,
       hint: "(space to toggle, type to re-filter after submit)",
       choices,
-      // keep limit reasonable
       limit: 15,
-    });
+    })();
 
-    let result;
-    try {
-      result = await ms.run(); // array of selected values (strings)
-    } catch {
-      // user aborted (Ctrl+C)
-      return [];
-    }
-
-    // result may contain '__TOGGLE__' and/or a selection of visible items
     if (result.includes("__TOGGLE__")) {
       const rest = result.filter((v) => v !== "__TOGGLE__");
-      if (rest.length === 0) {
-        // user selected only the toggle -> invert selection on visible items
+      if (!rest.length) {
         const allSelected = visible.every(({ it }) => selectedSet.has(it));
-        if (allSelected) {
-          // unselect all visible
-          for (const { it } of visible) selectedSet.delete(it);
-        } else {
-          // select all visible
-          for (const { it } of visible) selectedSet.add(it);
-        }
+        if (allSelected) visible.forEach(({ it }) => selectedSet.delete(it));
+        else visible.forEach(({ it }) => selectedSet.add(it));
       } else {
-        // user chose toggle + explicit items -> set visible items exactly to explicit selection
-        for (const { it } of visible) selectedSet.delete(it);
-        for (const v of rest) selectedSet.add(v);
+        visible.forEach(({ it }) => selectedSet.delete(it));
+        rest.forEach((v) => selectedSet.add(v));
       }
     } else {
-      // Normal path: set visible items to match selection
-      for (const { it } of visible) selectedSet.delete(it);
-      for (const v of result) selectedSet.add(v);
+      visible.forEach(({ it }) => selectedSet.delete(it));
+      result.forEach((v) => selectedSet.add(v));
     }
+  }
+}
 
-    // Loop back to allow re-filtering and fine-grain edits
+export async function confirm(message) {
+  try {
+    return await EnquirerConfirm({ name: "ok", message })();
+  } catch {
+    return await readlineConfirm(message);
   }
 }
 
 // -------------------------------------------------------------
-// Main Logic
+// Main logic
 // -------------------------------------------------------------
-export default async function main() {
+export async function main() {
   if (!has("git")) {
     console.error("git not found");
     process.exit(1);
@@ -253,7 +215,6 @@ export default async function main() {
     process.exit(1);
   }
 
-  // 1. Get refs
   const refs = run("git", [
     "for-each-ref",
     "--format=%(refname:short)",
@@ -269,23 +230,14 @@ export default async function main() {
     return;
   }
 
-  // 2. Select ref (fzf single or enquirer fallback)
   let refIdxs = await selectWithFzf(refs, "Select branch/tag", false);
-  let refIdx;
-  if (refIdxs === null) {
-    refIdx = await selectWithEnquirerSingle(refs, "Select branch or tag");
-  } else {
-    if (!refIdxs.length) {
-      console.log("No selection.");
-      return;
-    }
-    refIdx = refIdxs[0];
-  }
-
+  let refIdx =
+    refIdxs === null
+      ? await selectWithEnquirerSingle(refs, "Select branch or tag")
+      : refIdxs[0];
   const selectedRef = refs[refIdx];
   console.log("Selected ref:", selectedRef);
 
-  // 3. Fetch workflows
   const raw = run("gh", [
     "workflow",
     "list",
@@ -294,41 +246,34 @@ export default async function main() {
     "--json",
     "name,path,state",
   ]);
-
   let data;
   try {
     data = JSON.parse(raw);
   } catch (e) {
-    console.error("Invalid workflow JSON:", e && e.message ? e.message : e);
+    console.error("Invalid workflow JSON:", e.message);
     return;
   }
 
   const workflows = data
-    .filter((w) => w && w.state === "active")
+    .filter((w) => w.state === "active")
     .map((w) => `${w.name} — ${w.path}`);
-
   if (!workflows.length) {
     console.log("No active workflows.");
     return;
   }
 
-  // 4. Select workflows (multi)
   let wIdxs = await selectWithFzf(workflows, "Select workflows", true);
-  if (wIdxs === null) {
+  if (wIdxs === null)
     wIdxs = await selectWithEnquirerMulti(
       workflows,
       "Select workflows to dispatch",
     );
-  }
-
   if (!wIdxs.length) {
     console.log("Nothing selected.");
     return;
   }
 
   const chosen = wIdxs.map((i) => workflows[i]);
-
-  // Show summary
   console.log("\nWill dispatch:");
   for (const w of chosen) console.log(" -", w);
 
@@ -338,11 +283,9 @@ export default async function main() {
     return;
   }
 
-  // 5. Dispatch workflow runs
   for (const w of chosen) {
     const path = w.split(" — ")[1];
     console.log(`Dispatching ${path} on ${selectedRef}`);
-
     try {
       execFileSync("gh", ["workflow", "run", path, "--ref", selectedRef], {
         stdio: "inherit",
