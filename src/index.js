@@ -71,55 +71,134 @@ async function selectWithEnquirerSingle(items, message) {
   return items.indexOf(ans);
 }
 
-// MULTI SELECT WITH SELECT ALL / UNSELECT ALL
+// Replace your existing selectWithEnquirerMulti with this function.
+// It uses a loop: ask for a filter, present MultiSelect of filtered items
+// (with a Toggle visible option), update global selection state, repeat
+// until user confirms they're done.
 async function selectWithEnquirerMulti(items, message) {
-  const { MultiSelect, Separator } = await import("enquirer");
+  const { Input, MultiSelect, Separator } = await import("enquirer");
 
-  const choices = [
-    { name: "__select_all", message: "Select All", value: "__select_all" },
-    {
-      name: "__unselect_all",
-      message: "Unselect All",
-      value: "__unselect_all",
-    },
-    new Separator(),
-    ...items,
-  ];
+  // track selected values (strings from items)
+  const selectedSet = new Set();
 
-  const prompt = new MultiSelect({
-    name: "choices",
-    message,
-    hint: "(space to toggle, type to filter)",
-    choices,
-    result(names) {
-      // Strip out meta items
-      return names.filter((n) => !n.startsWith("__"));
-    },
-  });
+  // helper: show a short summary of current selections
+  function summary() {
+    if (selectedSet.size === 0) return "(none)";
+    const sample = Array.from(selectedSet).slice(0, 6);
+    return `${selectedSet.size} selected — ${sample.join(", ")}${selectedSet.size > 6 ? ", ..." : ""}`;
+  }
 
-  // Handle toggle events for select-all / unselect-all
-  prompt.on("toggle", (choice) => {
-    if (!choice) return;
+  while (true) {
+    // 1) Ask user for a filter string (empty => all). Special commands:
+    //    :done -> finish selection
+    //    :reset -> clear all selections
+    const inPrompt = new Input({
+      name: "filter",
+      message: `${message} — filter (empty = all). Commands: :done (finish), :reset (clear). Current: ${summary()}`,
+      initial: "",
+    });
 
-    if (choice.value === "__select_all") {
-      prompt.choices.forEach((c) => {
-        if (typeof c.value === "string" && !c.value.startsWith("__")) {
-          c.selected = true;
-        }
-      });
+    let filter;
+    try {
+      filter = (await inPrompt.run()).trim();
+    } catch {
+      // user aborted input (Ctrl+C)
+      return [];
     }
 
-    if (choice.value === "__unselect_all") {
-      prompt.choices.forEach((c) => {
-        if (typeof c.value === "string" && !c.value.startsWith("__")) {
-          c.selected = false;
-        }
-      });
+    if (filter === ":done") {
+      // finish and return selected indices
+      return Array.from(selectedSet)
+        .map((v) => items.indexOf(v))
+        .filter((i) => i >= 0);
     }
-  });
 
-  const picked = await prompt.run();
-  return picked.map((v) => items.indexOf(v));
+    if (filter === ":reset") {
+      selectedSet.clear();
+      // go back to filter prompt loop
+      continue;
+    }
+
+    // compute visible (filtered) items
+    const q = filter.toLowerCase();
+    const visible =
+      q === ""
+        ? items.map((it, idx) => ({ it, idx }))
+        : items
+            .map((it, idx) => ({ it, idx }))
+            .filter(({ it }) => it.toLowerCase().includes(q));
+
+    if (visible.length === 0) {
+      console.log("No items match that filter — try again.");
+      continue;
+    }
+
+    // Build MultiSelect choices: first the toggle option, then visible items
+    const choices = [
+      {
+        name: "__TOGGLE__",
+        message: `Toggle visible (${visible.length})`,
+        value: "__TOGGLE__",
+      },
+      new Separator(),
+      ...visible.map(({ it }) => ({
+        name: it,
+        message: it,
+        value: it,
+        // mark as selected if present in the global selectedSet
+        selected: selectedSet.has(it),
+      })),
+    ];
+
+    const ms = new MultiSelect({
+      name: "pick",
+      message: `Filtered: ${visible.length} shown — use space to (un)select, enter to submit`,
+      hint: "(space to toggle, type to re-filter after submit)",
+      choices,
+    });
+
+    let result;
+    try {
+      result = await ms.run(); // array of selected values (strings)
+    } catch {
+      // user aborted (Ctrl+C)
+      return [];
+    }
+
+    // result contains the selected values from the visible subset (and possibly __TOGGLE__)
+    // Handle toggle semantics:
+    if (result.includes("__TOGGLE__")) {
+      // If user selected only the toggle -> we interpret as "invert selection of visible"
+      const rest = result.filter((v) => v !== "__TOGGLE__");
+      if (rest.length === 0) {
+        // decide: if ALL visible currently selected -> unselect them; else select them
+        const allSelected = visible.every(({ it }) => selectedSet.has(it));
+        if (allSelected) {
+          // unselect all visible
+          for (const { it } of visible) selectedSet.delete(it);
+        } else {
+          // select all visible
+          for (const { it } of visible) selectedSet.add(it);
+        }
+      } else {
+        // toggle + some explicit selections -> treat explicit selections as chosen (remove toggle)
+        // update selectedSet: ensure visible items are set exactly to rest
+        // first remove all visible items from selectedSet
+        for (const { it } of visible) selectedSet.delete(it);
+        // then add rest
+        for (const v of rest) selectedSet.add(v);
+      }
+    } else {
+      // No toggle in result: update visible items to match selection
+      // remove all visible from selectedSet, then add those returned
+      for (const { it } of visible) selectedSet.delete(it);
+      for (const v of result) selectedSet.add(v);
+    }
+
+    // loop again: user can re-filter, check summary, etc.
+    // Optionally we could ask "done?" here, but the filter prompt supports :done
+    // and the loop shows the current summary so user knows status.
+  }
 }
 
 async function confirm(msg) {
