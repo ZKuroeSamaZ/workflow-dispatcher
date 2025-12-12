@@ -1,13 +1,8 @@
 // src/index.js
 import { execFileSync, spawn } from "node:child_process";
 import readline from "node:readline";
-import {
-  AutoComplete,
-  MultiSelect,
-  Separator,
-  Confirm as EnquirerConfirm,
-  Input,
-} from "enquirer";
+import Enquirer from "enquirer";
+const { AutoComplete, MultiSelect, Separator, Confirm, Input } = Enquirer;
 
 // -------------------------------------------------------------
 // Utilities
