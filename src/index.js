@@ -243,7 +243,7 @@ async function selectWithEnquirerMulti(items, message) {
 // -------------------------------------------------------------
 // Main Logic
 // -------------------------------------------------------------
-export async function main() {
+export default async function main() {
   if (!has("git")) {
     console.error("git not found");
     process.exit(1);
